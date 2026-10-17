@@ -3,17 +3,20 @@
 # towebp - multi-threaded batch conversion of JPG/JPEG/PNG images to WebP.
 # https://github.com/mnich/towebp
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Make Homebrew-installed tools (cwebp) visible in cron's minimal environment
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/home/linuxbrew/.linuxbrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 # Messages
-MSG_HELP_USAGE="Usage: towebp [-q quality] [-d directory] [-t threads] [--delete]"
+MSG_HELP_USAGE="Usage: towebp [-q quality] [-d directory] [-t threads] [--max-depth n] [--newer-than file] [--min-age min] [--delete]"
 MSG_HELP_OPTIONS="Options:
   -q, --quality <0-100>  WebP quality (default: 80)
   -d, --dir <path>       Directory with images (default: ~/Downloads)
   -t, --threads <n>      Number of parallel jobs (default: logical CPU count)
+      --max-depth <n>    Descend at most n levels (1 = only the directory itself; default: unlimited)
+      --newer-than <file>  Only images added/changed after <file> was last changed
+      --min-age <min>    Skip images modified less than <min> minutes ago (default: 0)
       --delete           Delete the original after a successful conversion
   -v, --version          Show version
   -h, --help             Show this help"
@@ -24,6 +27,9 @@ MSG_ERR_PARAM="Unknown parameter:"
 MSG_ERR_QUALITY="Error: Quality must be a number between 0 and 100:"
 MSG_ERR_THREADS="Error: Threads must be a positive integer:"
 MSG_ERR_DIR="Error: Directory does not exist:"
+MSG_ERR_MAX_DEPTH="Error: Max depth must be a positive integer:"
+MSG_ERR_NEWER="Error: Reference file does not exist:"
+MSG_ERR_MIN_AGE="Error: Min age must be a non-negative integer:"
 MSG_ERR_VALUE="Error: Missing value for parameter:"
 MSG_LOCKED="Another towebp instance is already running - skipping."
 MSG_START="Starting conversion in directory"
@@ -37,6 +43,9 @@ QUALITY=80
 DIRECTORY="$HOME/Downloads"
 THREADS=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
 DELETE_ORIGINAL=0
+MAX_DEPTH=""
+NEWER_THAN=""
+MIN_AGE=0
 
 require_value() {
     if [[ -z "$2" ]]; then
@@ -50,6 +59,9 @@ while [[ "$#" -gt 0 ]]; do
         -q|--quality) require_value "$1" "$2"; QUALITY="$2"; shift ;;
         -d|--dir) require_value "$1" "$2"; DIRECTORY="$2"; shift ;;
         -t|--threads) require_value "$1" "$2"; THREADS="$2"; shift ;;
+        --max-depth) require_value "$1" "$2"; MAX_DEPTH="$2"; shift ;;
+        --newer-than) require_value "$1" "$2"; NEWER_THAN="$2"; shift ;;
+        --min-age) require_value "$1" "$2"; MIN_AGE="$2"; shift ;;
         --delete) DELETE_ORIGINAL=1 ;;
         -v|--version)
             echo "towebp $VERSION"
@@ -79,6 +91,18 @@ if ! [[ "$THREADS" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ ! -d "$DIRECTORY" ]]; then
     echo "$MSG_ERR_DIR $DIRECTORY" >&2
+    exit 1
+fi
+if [[ -n "$MAX_DEPTH" ]] && ! [[ "$MAX_DEPTH" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$MSG_ERR_MAX_DEPTH $MAX_DEPTH" >&2
+    exit 1
+fi
+if [[ -n "$NEWER_THAN" && ! -e "$NEWER_THAN" ]]; then
+    echo "$MSG_ERR_NEWER $NEWER_THAN" >&2
+    exit 1
+fi
+if ! [[ "$MIN_AGE" =~ ^[0-9]+$ ]]; then
+    echo "$MSG_ERR_MIN_AGE $MIN_AGE" >&2
     exit 1
 fi
 
@@ -116,10 +140,20 @@ export DELETE_ORIGINAL
 
 echo "$MSG_START '$DIRECTORY' (Q: $QUALITY, Threads: $THREADS, Delete: $DELETE_ORIGINAL)..."
 
+# -maxdepth is a global option and must precede the tests
+FIND_ARGS=("$DIRECTORY")
+[[ -n "$MAX_DEPTH" ]] && FIND_ARGS+=(-maxdepth "$MAX_DEPTH")
+FIND_ARGS+=(-type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \))
+# ctime, not mtime: unzipped or AirDropped files keep their original mtime,
+# but their ctime is the moment they appeared in the directory
+[[ -n "$NEWER_THAN" ]] && FIND_ARGS+=(-cnewer "$NEWER_THAN")
+# Files still being downloaded or copied keep changing, so wait until they settle
+(( MIN_AGE > 0 )) && FIND_ARGS+=(-mmin "+$MIN_AGE")
+
 # -print0 / -0 keep paths with spaces and special characters intact.
 # Each file is processed by its own bash process; '_' fills in $0.
 set -o pipefail
-find "$DIRECTORY" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) -print0 | \
+find "${FIND_ARGS[@]}" -print0 | \
 xargs -0 -P "$THREADS" -n 1 "$BASH" -c '
     file="$1"
     filename="${file%.*}"
